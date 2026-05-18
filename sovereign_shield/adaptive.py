@@ -82,74 +82,14 @@ _SECURITY_TERMS = {t.lower() for t in _INPUT_SECURITY_TERMS} | {
 # Includes: articles, prepositions, pronouns, conjunctions, common verbs,
 # greetings, everyday nouns, question words, and high-frequency words
 # that appear equally in benign and attack inputs.
-_STOPWORDS = {
-    # Articles, prepositions, conjunctions
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "can", "shall", "to", "of", "in", "for",
-    "on", "with", "at", "by", "from", "as", "into", "through", "about",
-    "and", "but", "or", "nor", "not", "so", "yet", "both", "either",
-    "neither", "this", "that", "these", "those", "it", "its", "my",
-    "your", "his", "her", "our", "their", "me", "him", "us", "them",
-    "i", "you", "he", "she", "we", "they", "what", "which", "who",
-    "how", "when", "where", "why", "all", "each", "every", "some",
-    "any", "no", "just", "also", "very", "too", "please", "then",
-    "now", "here", "there", "up", "out", "if", "than", "after",
-    "before", "above", "below", "between", "under", "over",
-    # Greetings and polite words
-    "hello", "hi", "hey", "goodbye", "bye", "thanks", "thank",
-    "sorry", "welcome", "ok", "okay", "yes", "no", "yeah", "nope",
-    # Common verbs (too generic to be attack signals)
-    "get", "got", "give", "gave", "make", "made", "take", "took",
-    "come", "came", "go", "went", "gone", "see", "saw", "seen",
-    "know", "knew", "known", "think", "thought", "want", "need",
-    "like", "look", "looked", "find", "found", "tell", "told",
-    "ask", "asked", "try", "tried", "use", "used", "work", "worked",
-    "call", "called", "keep", "kept", "let", "help", "helped",
-    "start", "started", "showed", "hear", "heard",
-    "play", "played", "move", "moved", "live", "lived",
-    "believe", "bring", "brought", "happen", "happened",
-    "write", "wrote", "written", "read", "provide", "provided",
-    "set", "put", "mean", "meant", "become", "became",
-    "leave", "left", "begin", "began", "seem", "seemed",
-    "follow", "followed", "create", "created", "speak", "spoke",
-    "allow", "allowed", "add", "added", "grow", "grew",
-    "open", "opened", "walk", "walked", "offer", "offered",
-    "remember", "consider", "appear", "appeared", "serve", "served",
-    "expect", "expected", "suggest", "suggested",
-    # Common everyday nouns
-    "world", "people", "time", "year", "day", "way", "man", "woman",
-    "child", "thing", "life", "hand", "part", "place", "case",
-    "week", "company", "group", "problem", "fact",
-    "good", "great", "new", "old", "big", "small", "long", "short",
-    "right", "left", "best", "last", "first", "next", "other",
-    "name", "word", "number", "line", "point", "home", "water",
-    "room", "area", "money", "story", "book", "answer", "question",
-    "side", "head", "house", "game", "example", "food",
-    # Tech words too generic to signal attacks
-    "code", "data", "file", "user", "test", "type", "text",
-    "list", "sort", "page", "link", "site", "web", "app",
-    "program", "function", "class", "method", "object", "value",
-    "result", "output", "input", "error", "message",
-    "save", "load", "send", "stop", "using", "like",
-    # More high-frequency benign words
-    "more", "most", "much", "many", "well", "back", "even",
-    "still", "own", "same", "different", "such", "only", "really",
-    "always", "never", "often", "sometimes", "already", "sure",
-    "must", "should", "ought", "might", "may", "can", "could",
-    "absolutely", "entirely", "completely", "fully", "totally", "partially", "slightly",
-    "sentence", "sentences", "translate", "french", "english", "spanish",
-    "german", "language", "meaning", "define", "explain",
-    "character", "characters", "letter", "letters", "word", "words",
-    "today", "tomorrow", "yesterday", "morning", "night",
-    "many", "most", "several", "much", "very", "too", "enough",
-    "everything", "something", "anything", "nothing", "around",
-    "specifically", "basically", "clearly", "possibly", "usually",
-    "often", "always", "sometimes", "already", "sure",
-    "edit", "describe", "explain", "summarize", "spelling", "grammar",
-    "mistake", "mistakes", "check", "checks", "verify", "correct", "improve",
-    "improvement", "text", "write", "provide", "setting", "settings",
-}
+_STOPWORDS: Set[str] = set()
+_stopwords_path = os.path.join(os.path.dirname(__file__), "data", "stopwords.json")
+if os.path.exists(_stopwords_path):
+    try:
+        with open(_stopwords_path, 'r', encoding='utf-8') as f:
+            _STOPWORDS = set(json.load(f))
+    except Exception as e:
+        logger.error(f"Failed to load Stopwords: {e}")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scan_log (
@@ -250,16 +190,20 @@ class AdaptiveShield:
     # ------------------------------------------------------------------
 
     def _get_conn(self) -> sqlite3.Connection:
-        os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        if not hasattr(self, "_local"):
+            self._local = threading.local()
+        if not hasattr(self._local, "conn"):
+            os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
+            conn = sqlite3.connect(self._db_path)
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
+        return self._local.conn
 
     def _init_db(self):
         conn = self._get_conn()
         conn.executescript(_SCHEMA)
         conn.commit()
-        conn.close()
+        pass  # conn.close() removed for connection pooling
 
 
 
@@ -305,7 +249,7 @@ class AdaptiveShield:
             )
 
         conn.commit()
-        conn.close()
+        pass  # conn.close() removed for connection pooling
         logger.info(f"Imported {len(rule_rows)} rules and {len(kw_rows)} keywords from {path}")
 
     def _load_approved_rules(self):
@@ -314,7 +258,7 @@ class AdaptiveShield:
         cur.execute("SELECT pattern FROM rules WHERE status = 'approved'")
         for row in cur.fetchall():
             self._custom_rules.add(row["pattern"].lower())
-        conn.close()
+        pass  # conn.close() removed for connection pooling
         if self._custom_rules:
             logger.info(f"Loaded {len(self._custom_rules)} custom rules from database.")
 
@@ -332,7 +276,7 @@ class AdaptiveShield:
                 self._category_keywords[cat].add(kw)
         except sqlite3.OperationalError:
             pass  # Table may not exist yet on first run
-        conn.close()
+        pass  # conn.close() removed for connection pooling
         total = sum(len(v) for v in self._category_keywords.values())
         if total:
             logger.info(f"Loaded {total} category keywords across {len(self._category_keywords)} categories.")
@@ -342,11 +286,17 @@ class AdaptiveShield:
         conn = self._get_conn()
         conn.execute("DELETE FROM scan_log WHERE timestamp < ?", (cutoff,))
         conn.commit()
-        conn.close()
+        pass  # conn.close() removed for connection pooling
 
     # ------------------------------------------------------------------
     # SCAN
     # ------------------------------------------------------------------
+
+    def close(self):
+        """Close the SQLite connection for the current thread."""
+        if hasattr(self, "_local") and hasattr(self._local, "conn"):
+            self._local.conn.close()
+            del self._local.conn
 
     def scan(self, text: str) -> dict:
         """
@@ -434,7 +384,7 @@ class AdaptiveShield:
                 (scan_id, text, int(is_safe), stage, reason, time.time()),
             )
             conn.commit()
-            conn.close()
+            pass  # conn.close() removed for connection pooling
 
         return {
             "scan_id": scan_id,
@@ -473,7 +423,7 @@ class AdaptiveShield:
             (scan_id,),
         )
         row = cur.fetchone()
-        conn.close()
+        pass  # conn.close() removed for connection pooling
 
         if not row:
             return {"report_id": None, "status": "error", "rule_created": False,
@@ -498,7 +448,7 @@ class AdaptiveShield:
                 (report_id, scan_id, input_text, reason, time.time(), "pending"),
             )
             conn.commit()
-            conn.close()
+            pass  # conn.close() removed for connection pooling
 
         # --- V2: Keyword extraction + category classification ---
         keywords = self._extract_keywords(input_text)
@@ -539,7 +489,7 @@ class AdaptiveShield:
                         except sqlite3.IntegrityError:
                             pass
                     conn.commit()
-                    conn.close()
+                    pass  # conn.close() removed for connection pooling
 
                 # Update in-memory category keywords
                 if category not in self._category_keywords:
@@ -644,7 +594,7 @@ class AdaptiveShield:
                      time.time(), "pending_prune"),
                 )
                 conn.commit()
-                conn.close()
+                pass  # conn.close() removed for connection pooling
             return {
                 "status": "pending_review",
                 "pruned_keywords": [],
@@ -660,7 +610,7 @@ class AdaptiveShield:
             (scan_id,),
         )
         row = cur.fetchone()
-        conn.close()
+        pass  # conn.close() removed for connection pooling
 
         if not row:
             return {"status": "error", "pruned_keywords": [],
@@ -717,7 +667,7 @@ class AdaptiveShield:
                             learned_kws.discard(kw)
                             pruned.append(kw)
                         conn.commit()
-                        conn.close()
+                        pass  # conn.close() removed for connection pooling
 
                     # Clean up empty categories
                     if not learned_kws:
@@ -739,7 +689,7 @@ class AdaptiveShield:
                  time.time(), "false_positive"),
             )
             conn.commit()
-            conn.close()
+            pass  # conn.close() removed for connection pooling
 
         if pruned:
             return {
@@ -771,7 +721,7 @@ class AdaptiveShield:
             (exclude_scan_id,)
         )
         rows = cur.fetchall()
-        conn.close()
+        pass  # conn.close() removed for connection pooling
 
         total = len(rows)
         if total == 0:
@@ -806,7 +756,7 @@ class AdaptiveShield:
             (exclude_scan_id,),
         )
         rows = cur.fetchall()
-        conn.close()
+        pass  # conn.close() removed for connection pooling
 
         total = len(rows)
         if total == 0:
@@ -841,7 +791,7 @@ class AdaptiveShield:
                  sandbox["total_tested"], status, time.time()),
             )
             conn.commit()
-            conn.close()
+            pass  # conn.close() removed for connection pooling
 
     # ------------------------------------------------------------------
     # KEYWORD EXTRACTION + CLASSIFICATION
@@ -928,7 +878,7 @@ class AdaptiveShield:
         else:
             cur.execute("SELECT * FROM rules")
         rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
+        pass  # conn.close() removed for connection pooling
         return rows
 
     def approve_rule(self, rule_id: str) -> bool:
@@ -938,12 +888,12 @@ class AdaptiveShield:
         cur.execute("SELECT pattern FROM rules WHERE rule_id = ?", (rule_id,))
         row = cur.fetchone()
         if not row:
-            conn.close()
+            pass  # conn.close() removed for connection pooling
             return False
         pattern = row["pattern"].lower()
         conn.execute("UPDATE rules SET status = 'approved' WHERE rule_id = ?", (rule_id,))
         conn.commit()
-        conn.close()
+        pass  # conn.close() removed for connection pooling
         self._custom_rules.add(pattern)
         return True
 
@@ -952,7 +902,7 @@ class AdaptiveShield:
         conn = self._get_conn()
         conn.execute("UPDATE rules SET status = 'rejected' WHERE rule_id = ?", (rule_id,))
         conn.commit()
-        conn.close()
+        pass  # conn.close() removed for connection pooling
         return True
 
     def approve_all_pending(self) -> int:
@@ -970,7 +920,7 @@ class AdaptiveShield:
             self._custom_rules.add(row["pattern"].lower())
             count += 1
         conn.commit()
-        conn.close()
+        pass  # conn.close() removed for connection pooling
         return count
 
     def get_reports(self) -> List[dict]:
@@ -979,7 +929,7 @@ class AdaptiveShield:
         cur = conn.cursor()
         cur.execute("SELECT * FROM reports ORDER BY timestamp DESC")
         rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
+        pass  # conn.close() removed for connection pooling
         return rows
 
     @property
@@ -1005,7 +955,7 @@ class AdaptiveShield:
         approved = cur.fetchone()["c"]
         cur.execute("SELECT COUNT(*) as c FROM rules WHERE status = 'pending'")
         pending = cur.fetchone()["c"]
-        conn.close()
+        pass  # conn.close() removed for connection pooling
         return {
             "total_scans": total_scans,
             "total_reports": total_reports,

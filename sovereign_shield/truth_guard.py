@@ -312,7 +312,8 @@ class TruthGuard:
     @staticmethod
     def _hash_claim(text: str) -> str:
         """Generate a normalized hash for a factual claim."""
-        normalized = re.sub(r'[^\w\s]', '', text.lower()).strip()
+        import string
+        normalized = text.lower().translate(str.maketrans('', '', string.punctuation)).strip()
         normalized = re.sub(r'\s+', ' ', normalized)
         return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 

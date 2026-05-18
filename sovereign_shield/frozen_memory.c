@@ -57,14 +57,20 @@ static void secure_wipe(void *ptr, size_t size) {
  * Page size helper
  * ================================================================ */
 
-static size_t get_page_size(void) {
+static size_t cached_page_size = 0;
+
+static void init_page_size(void) {
 #ifdef _WIN32
     SYSTEM_INFO si;
     GetSystemInfo(&si);
-    return (size_t)si.dwPageSize;
+    cached_page_size = (size_t)si.dwPageSize;
 #else
-    return (size_t)sysconf(_SC_PAGESIZE);
+    cached_page_size = (size_t)sysconf(_SC_PAGESIZE);
 #endif
+}
+
+static size_t get_page_size(void) {
+    return cached_page_size;
 }
 
 
@@ -398,6 +404,8 @@ static struct PyModuleDef frozen_memory_module = {
 
 PyMODINIT_FUNC PyInit_frozen_memory(void) {
     PyObject *m;
+    
+    init_page_size();
 
     if (PyType_Ready(&FrozenBufferType) < 0)
         return NULL;

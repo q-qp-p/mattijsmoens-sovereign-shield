@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sovereign-shield"
-version = "3.2.0"
+version = "3.3.0"
 description = "Production-grade AI defense — hybrid deterministic filters + optional LLM veto + HITL approval + file validation + hallucination detection. OS-enforced immutability."
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -40,6 +40,11 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: C",
     "Operating System :: OS Independent",
+]
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "pydantic>=2.0.0"
 ]
 
 [project.optional-dependencies]

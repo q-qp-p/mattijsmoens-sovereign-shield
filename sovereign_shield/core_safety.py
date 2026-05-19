@@ -601,6 +601,38 @@ class CoreSafety(metaclass=FrozenNamespace):
                         logger.critical(f"BLOCKED: Dynamic echo hallucination: '{phrase}'")
                         return False, f"Echo hallucination detected: '{phrase}'"
 
+        # --- Check 14: Universal AI Anti-Patterns (Terminal) ---
+        if action_type == "SHELL_EXEC":
+            cmd = str(payload).strip()
+            # Anti-pattern: Greedy Git
+            if re.search(r"git\s+add\s+(\.|\*)", cmd):
+                logger.critical("BLOCKED: Greedy git add detected.")
+                return False, "Greedy git add detected. Explicitly list files to add instead of using '.' or '*'."
+            # Anti-pattern: Context Blindness
+            if re.search(r"(cat|tail)\s+.*\.(log|sql|csv)(\s|$)", cmd) and not re.search(r"(head\s+-n|tail\s+-n|grep)", cmd):
+                logger.critical("BLOCKED: Context blindness risk.")
+                return False, "Context blindness risk. Do not read raw .log, .sql, or .csv files without bounds limits (e.g., use head -n 50 or grep)."
+            # Anti-pattern: Interactive Trap
+            if re.match(r"^(npm|npx|apt-get|apt)\s", cmd) and not re.search(r"(-y|--yes|--non-interactive)", cmd):
+                logger.critical("BLOCKED: Interactive trap detected.")
+                return False, "Interactive trap detected. Must pass -y or --yes flag for apt/npm/npx commands."
+            # Anti-pattern: CD Trap
+            if re.search(r"(^|&&|;|\|)\s*cd\s+", cmd):
+                logger.critical("BLOCKED: CD trap detected.")
+                return False, "CD trap detected. Do not use 'cd' in commands; use the native 'cwd' argument instead."
+
+        # --- Check 15: Universal AI Anti-Patterns (File System) ---
+        if action_type == "WRITE_FILE":
+            content = str(payload)
+            # Anti-pattern: Binary Hallucination
+            if re.search(r"[a-zA-Z0-9+/=]{500,}", content):
+                logger.critical("BLOCKED: Binary hallucination detected.")
+                return False, "Binary hallucination detected. Cannot write 500+ contiguous alphanumeric characters."
+            # Anti-pattern: Lazy Placeholder
+            if re.search(r"(// rest of|<!-- existing|# rest of)", content.lower()):
+                logger.critical("BLOCKED: Lazy placeholder detected.")
+                return False, "Lazy placeholder detected. Do not use comments to skip code sections."
+
         # --- Check 13: Rate Limiter ---
         if rate_limit_interval > 0:
             with cls._LOCK:

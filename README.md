@@ -216,6 +216,7 @@ Key checks performed during response validation:
 | **Malicious Syntax** | `<script>`, SQL injection (`DROP TABLE`, `UNION SELECT`), shell commands (`rm -rf`, `nc -e`), Python injection (`eval(`, `__import__(`), PowerShell injection |
 | **Code Exfiltration** | Detects if the LLM's response contains references to internal class names, functions, module imports, or architecture details |
 | **Action Hallucination** | Catches the LLM claiming to "analyze", "process", or "examine" something when it's only generating text |
+| **Universal AI Anti-Patterns** | *(v3.3.1+)* Catches greedy git commands, context blindness (raw log reads), missing non-interactive flags (`npm -y`), binary generation hallucinations, and `// rest of code` lazy placeholders during `SHELL_EXEC` and `WRITE_FILE` actions |
 
 > **⚠️ Threat Model:** In-process OS memory protection defeats all standard Python-level bypass techniques (`type.__setattr__`, `ctypes.pythonapi`, `_STATE` mutation, lockfile overwrite). Both `core_safety.py` and `conscience.py` use closure-based seals frozen into OS-protected memory. For adversarial scenarios where the attacker has full code execution access within the same process, use the **Out-of-Process** mode (`sovereign-shield-daemon`) which provides a true process-boundary security seal.
 

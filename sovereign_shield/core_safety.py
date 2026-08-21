@@ -287,7 +287,34 @@ class CoreSafety(metaclass=FrozenNamespace):
     _STATE = {
         "last_action_time": 0,
         "dynamic_filter": [],
+        # Whether running with elevated privileges BLOCKS every action.
+        #
+        # This used to be unconditional, which made the library unusable
+        # anywhere root is normal - most notably inside Docker containers,
+        # where running as root is the default. Every audit_action() call
+        # returned "Elevated privileges detected", so the engine silently
+        # refused to do anything. IntentShield removed the equivalent check in
+        # v1.2.0 for exactly this reason.
+        #
+        # The default is now to WARN once and continue. Set it back to True via
+        # CoreSafety.set_privilege_policy(block=True) if your deployment really
+        # must refuse to run elevated.
+        "block_when_elevated": False,
+        "privilege_warning_emitted": False,
     }
+
+    @classmethod
+    def set_privilege_policy(cls, block: bool):
+        """
+        Control what happens when the process runs as root/Administrator.
+
+        Args:
+            block: True restores the pre-3.4.1 behaviour, where elevated
+                privileges cause every action to be denied. False (default)
+                logs a single warning and proceeds.
+        """
+        cls._STATE["block_when_elevated"] = bool(block)
+        cls._STATE["privilege_warning_emitted"] = False
 
     # ---------------------------------------------------------------
     # DYNAMIC FILTER (Semantic Equivalence Matrix)
@@ -485,8 +512,17 @@ class CoreSafety(metaclass=FrozenNamespace):
                 if hasattr(os, 'getuid'):
                     is_admin = os.getuid() == 0
             if is_admin:
-                logger.critical("PRIVILEGE VIOLATION: Process running as admin/root.")
-                return False, "Elevated privileges detected. System requires standard user privileges only."
+                if cls._STATE.get("block_when_elevated"):
+                    logger.critical("PRIVILEGE VIOLATION: Process running as admin/root.")
+                    return False, "Elevated privileges detected. System requires standard user privileges only."
+                if not cls._STATE.get("privilege_warning_emitted"):
+                    cls._STATE["privilege_warning_emitted"] = True
+                    logger.warning(
+                        "Running with elevated privileges (root/Administrator). "
+                        "This is normal inside containers and CI. Actions are "
+                        "NOT blocked; call CoreSafety.set_privilege_policy("
+                        "block=True) to refuse to operate when elevated."
+                    )
         except Exception as e:
             logger.warning(f"Privilege check inconclusive: {e}")
 

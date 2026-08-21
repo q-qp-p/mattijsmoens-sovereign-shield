@@ -214,13 +214,20 @@ class VetoShield:
                         docs.append(doc)
                         veto_reasons.append(why)
                     if any(d is None for d in docs):
-                        first = next(w for d, w in zip(docs, veto_reasons) if d is None)
+                        # Name the offending model. With a panel of three,
+                        # "a document failed schema validation" is not
+                        # actionable; knowing which provider produced it is.
+                        idx = next(i for i, d in enumerate(docs) if d is None)
+                        offender = getattr(self.providers[idx], "name",
+                                           f"Model {idx + 1}")
+                        first = veto_reasons[idx]
                         self._stats["validation_vetoes"] += 1
                         elapsed = (time.time() - start) * 1000
                         return {
                             "allowed": False,
                             "layer": "llm_veto",
-                            "reason": f"VETOED (structured validation failed): {first}",
+                            "reason": (f"VETOED ({offender}) structured "
+                                       f"validation failed: {first}"),
                             "llm_response": " | ".join(
                                 f"M{i+1}: {r}" for i, r in enumerate(llm_responses)),
                             "llm_validated": False,

@@ -54,17 +54,66 @@ _LIE_WORDS = [
 ]
 _LIE_WORDS_PATTERN = re.compile(r'\b(' + '|'.join(_LIE_WORDS) + r')\b')
 
-# Unauthorized tool invocation syntax
-# Catches patterns like <TOOL_NAME(args)> or TOOL_NAME(args)
+# Unauthorized tool invocation syntax.
+#
+# The bracketed form <TOOL_NAME(args)> is unambiguous. The bare form
+# TOOL_NAME(args) is not: it also matches ordinary uppercase function calls
+# such as MAX(x), SELECT(...), COUNT(*) or JSON(...), so any answer that
+# discussed SQL or maths was vetoed as a fake tool invocation. Common
+# function names are therefore excluded from the bare form.
+_COMMON_UPPER_CALLS = {
+    # SQL / data
+    "SELECT", "INSERT", "UPDATE", "DELETE", "COUNT", "SUM", "AVG", "MIN",
+    "MAX", "ABS", "ROUND", "CAST", "COALESCE", "CONCAT", "SUBSTR",
+    "SUBSTRING", "LENGTH", "TRIM", "UPPER", "LOWER", "GROUP", "ORDER",
+    "WHERE", "JOIN", "UNION", "VALUES", "DISTINCT",
+    # formats / protocols
+    "JSON", "XML", "CSV", "HTML", "URL", "URI", "UUID", "HTTP", "HTTPS",
+    "GET", "POST", "PUT", "PATCH", "HEAD",
+    # maths / general
+    "LOG", "EXP", "SQRT", "POW", "MOD", "AND", "OR", "NOT", "IF", "SET",
+}
+_FAKE_TOOL_BRACKETED = re.compile(r'<\b[A-Z_]{3,}\(.*?\)>')
+_FAKE_TOOL_BARE = re.compile(r'\b([A-Z_]{3,})\(.*?\)')
+
+
+def _looks_like_fake_tool(text):
+    """True if `text` contains unauthorized tool-invocation syntax."""
+    if _FAKE_TOOL_BRACKETED.search(text):
+        return True
+    return any(name not in _COMMON_UPPER_CALLS
+               for name in _FAKE_TOOL_BARE.findall(text))
+
+
+# Retained for backward compatibility with callers that imported it.
 _FAKE_TOOL_PATTERN = re.compile(r'<\b[A-Z_]{3,}\(.*?\)>|\b[A-Z_]{3,}\(.*?\)')
 
-# Harmful intent keywords
-_BAD_WORDS = [
-    "KILL", "HURT", "DESTROY", "STEAL", "HACK", "VIRUS", "EXPLODE",
-    "EXPLOSIVE", "WIPE", "ATTACK", "INSULT", "GENOCIDE", "SUICIDE",
-    "THEFT", "HARM", "HARMFUL", "BOMB", "MALICIOUS", "MISINFORMATION",
-    "RUIN", "UNMAKE", "WEAPON", "EVIL", "MALICE"
+# Harmful intent keywords, split by how much evidence one mention provides.
+#
+# _HARM_DIRECT are imperative or severe enough that a single mention is
+# grounds to block: there is no benign reading of "destroy the database".
+_HARM_DIRECT = [
+    "KILL", "HURT", "DESTROY", "STEAL", "EXPLODE", "EXPLOSIVE", "WIPE",
+    "GENOCIDE", "SUICIDE", "THEFT", "BOMB", "RUIN", "UNMAKE",
 ]
+
+# _HARM_CONTEXTUAL are words that appear constantly in legitimate security
+# discourse - "analyze this malicious payload", "the attack used a virus",
+# "is this harmful?". Blocking on a single mention made the engine unusable
+# for its own subject matter: it vetoed a verifier LLM that replied
+# "UNSAFE - this is a prompt injection attack" purely for the word ATTACK.
+# Corroboration is required instead, mirroring the 2-hit threshold that
+# InputFilter already uses to hold its false-positive rate at zero.
+_HARM_CONTEXTUAL = [
+    "HACK", "VIRUS", "ATTACK", "INSULT", "HARM", "HARMFUL",
+    "MALICIOUS", "MISINFORMATION", "WEAPON", "EVIL", "MALICE",
+]
+
+# Retained for backward compatibility with callers that imported the union.
+_BAD_WORDS = _HARM_DIRECT + _HARM_CONTEXTUAL
+
+_HARM_DIRECT_PATTERN = re.compile(r'\b(' + '|'.join(_HARM_DIRECT) + r')\b')
+_HARM_CONTEXTUAL_PATTERN = re.compile(r'\b(' + '|'.join(_HARM_CONTEXTUAL) + r')\b')
 _BAD_WORDS_PATTERN = re.compile(r'\b(' + '|'.join(_BAD_WORDS) + r')\b')
 
 # Intellectual property extraction keywords
@@ -73,7 +122,11 @@ _IP_WORDS = [
     "YOUR CODE", "MY CODE", "OWN CODE", "CODEBASE",
     "SYSTEM PROMPT", "REVEAL CODE", "SHOW ME YOUR CODE",
     "HOW DO YOU WORK", "HOW YOU WORK", "UNDER THE HOOD",
-    "ALGORITHM", "ALGORITHMS", "DIRECTORY STRUCTURE"
+    # "ALGORITHM"/"ALGORITHMS" used to be here, but they are ordinary
+    # technical vocabulary - "explain the sorting algorithm" is not an
+    # exfiltration attempt. Callers who genuinely need them can pass
+    # additional_ip_words=["ALGORITHM", "ALGORITHMS"].
+    "DIRECTORY STRUCTURE"
 ]
 _IP_WORDS_PATTERN = re.compile(r'\b(' + '|'.join(_IP_WORDS) + r')\b')
 
@@ -227,10 +280,11 @@ class Conscience(metaclass=FrozenNamespace):
     # ---------------------------------------------------------------
     @classmethod
     def evaluate_action(cls, action, context, exempt_actions=None,
-                        creative_exempt_actions=None, additional_ip_words=None):
+                        creative_exempt_actions=None, additional_ip_words=None,
+                        harm_context_threshold=2):
         """
         Evaluate an action against ethical directives.
-        
+
         Args:
             action: The action name/type (e.g. 'ANSWER', 'BROWSE', 'WRITE_FILE').
             context: The full context string (user input, payload, etc.).
@@ -239,7 +293,14 @@ class Conscience(metaclass=FrozenNamespace):
             creative_exempt_actions: Set of action types that bypass all checks
                                     (e.g. creative writing modes).
             additional_ip_words: Extra keywords to flag as IP extraction attempts.
-            
+            harm_context_threshold: How many DISTINCT contextual harm words
+                                    (_HARM_CONTEXTUAL) must appear before the
+                                    action is blocked. Words in _HARM_DIRECT
+                                    always block on a single match regardless.
+                                    Set to 1 to restore pre-3.4 behaviour, at
+                                    the cost of vetoing ordinary security
+                                    discussion.
+
         Returns:
             tuple: (approved: bool, reason: str)
         """
@@ -274,15 +335,27 @@ class Conscience(metaclass=FrozenNamespace):
         # Only enforced on non-exempt actions (exempt actions may legitimately
         # reference tool syntax in their payloads)
         if action_str not in exempt_actions:
-            if _FAKE_TOOL_PATTERN.search(check_str):
+            if _looks_like_fake_tool(check_str):
                 logger.warning(f"[Conscience] VETO: Unauthorized tool syntax in '{action}'")
                 return False, "Unauthorized tool invocation syntax detected."
 
         # --- Check 3: Harm Reduction ---
-        # Blocks actions containing violence, destruction, or theft keywords
-        if action_str not in exempt_actions and _BAD_WORDS_PATTERN.search(check_str_clean):
-            logger.warning(f"[Conscience] VETO: Harmful intent in '{action}'")
-            return False, "Action violates harm reduction directive."
+        # Direct harm words block on a single match; contextual ones need
+        # corroboration, so that describing an attack is not treated as
+        # intending one. See _HARM_DIRECT / _HARM_CONTEXTUAL above.
+        if action_str not in exempt_actions:
+            direct = _HARM_DIRECT_PATTERN.search(check_str_clean)
+            if direct:
+                logger.warning(f"[Conscience] VETO: Harmful intent in '{action}'")
+                return False, "Action violates harm reduction directive."
+
+            contextual = set(_HARM_CONTEXTUAL_PATTERN.findall(check_str_clean))
+            if len(contextual) >= harm_context_threshold:
+                logger.warning(
+                    f"[Conscience] VETO: Harmful intent in '{action}' "
+                    f"({len(contextual)} contextual harm terms: {sorted(contextual)})"
+                )
+                return False, "Action violates harm reduction directive."
 
         # --- Check 4: Security Evasion ---
         # Catches attempts to bypass or ignore security directives
@@ -298,7 +371,12 @@ class Conscience(metaclass=FrozenNamespace):
             "OPERATE WITHOUT", "OVERRIDE SAFETY", "SAFETY SUSPENDED",
             "SAFETY CHECKS DISABLED", "SAFETY MODULE",
             "UNRESTRICTED MODE", "TRANSPARENT MODE",
-            "ALL RESTRICTIONS REMOVED", "GUARDRAILS",
+            "ALL RESTRICTIONS REMOVED",
+            # "GUARDRAILS" alone matched ordinary AI discussion ("the model
+            # has guardrails"). Only the attempts to remove them are evasion.
+            "NO GUARDRAILS", "WITHOUT GUARDRAILS", "REMOVE GUARDRAILS",
+            "DISABLE GUARDRAILS", "BYPASS GUARDRAILS", "GUARDRAILS OFF",
+            "IGNORE GUARDRAILS", "GUARDRAILS REMOVED", "GUARDRAILS DISABLED",
         ]
         if any(w in check_str_clean for w in evasion_words):
             logger.warning(f"[Conscience] VETO: Evasion attempt in '{action}'")

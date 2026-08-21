@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sovereign-shield"
-version = "3.3.1"
+version = "3.4.0"
 description = "Production-grade AI defense — hybrid deterministic filters + optional LLM veto + HITL approval + file validation + hallucination detection. OS-enforced immutability."
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -41,11 +41,14 @@ classifiers = [
     "Programming Language :: C",
     "Operating System :: OS Independent",
 ]
-dependencies = [
-    "fastapi>=0.100.0",
-    "uvicorn>=0.23.0",
-    "pydantic>=2.0.0"
-]
+# No runtime dependencies. The entire engine - InputFilter, CoreSafety,
+# Conscience, AdaptiveShield, VetoShield, canonical_json and the local daemon
+# (stdlib http.server) - is pure standard library.
+#
+# fastapi/uvicorn/pydantic were previously declared here, which made the
+# "zero core dependencies" badge false and pulled a web stack into every
+# install. Nothing in the package imports them.
+dependencies = []
 
 [project.optional-dependencies]
 gemini = ["google-genai>=1.0.0"]

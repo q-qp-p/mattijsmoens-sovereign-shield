@@ -18,7 +18,6 @@ Thumbs.db
 
 # Data / Runtime
 *.db
-*.json
 !sovereign_shield/trained_rules.json
 daily_usage.txt
 .core_safety_lock
@@ -26,16 +25,30 @@ daily_usage.txt
 _test_lora_data/
 _test_truth_data/
 _test_data/
-data/
 
-# Test & Training scripts (root only — tests/ directory is tracked)
-test_*.py
-!tests/test_sovereign_shield.py
-train*.py
-stress_test*.py
-corpus_*.py
-jailbreak_corpus*.py
-seed_benign.py
+# Runtime data at the repository ROOT only.
+#
+# This was "data/", which git matches at any depth — so it also excluded
+# sovereign_shield/data/, containing the 11,954-word Safe Baseline and the
+# stopword list. Those are source, not runtime state. A fresh clone without
+# them loads an EMPTY baseline, and input_filter does so silently, which
+# quietly weakens the false-positive controls the package is built around.
+/data/
+
+# The bare "*.json" rule had the same problem: it excluded the packaged data
+# files too. JSON is ignored at the root only.
+/*.json
+!sovereign_shield/data/*.json
+
+# Test & Training scripts. The leading slash anchors these to the repository
+# root; without it "test_*.py" matched at any depth and silently excluded
+# everything under tests/ except one whitelisted file.
+/test_*.py
+/train*.py
+/stress_test*.py
+/corpus_*.py
+/jailbreak_corpus*.py
+/seed_benign.py
 ROADMAP.md
 
 # Env

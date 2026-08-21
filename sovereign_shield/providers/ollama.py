@@ -10,7 +10,12 @@ import urllib.request
 import urllib.error
 
 from sovereign_shield.providers.base import LLMProvider
-from sovereign_shield.prompts import VERIFICATION_PROMPT
+from sovereign_shield.prompts import (
+    VERIFICATION_PROMPT,
+    STRUCTURED_VERIFICATION_PROMPT,
+    VERDICT_CATEGORIES,
+    VERDICT_SEVERITIES,
+)
 
 
 class OllamaProvider(LLMProvider):
@@ -25,17 +30,32 @@ class OllamaProvider(LLMProvider):
         self._host = host.rstrip("/")
 
     def verify(self, text: str) -> str:
-        prompt = VERIFICATION_PROMPT.format(text=text)
+        return self._run(VERIFICATION_PROMPT.format(text=text), num_predict=10)
 
-        payload = json.dumps({
+    def verify_structured(self, text: str) -> str:
+        """Ask for a JSON verdict document for multi-model consensus."""
+        prompt = STRUCTURED_VERIFICATION_PROMPT.format(
+            text=text,
+            categories=list(VERDICT_CATEGORIES),
+            severities=list(VERDICT_SEVERITIES),
+        )
+        # Ollama can constrain decoding to JSON natively, which removes most
+        # unparseable replies before they reach the schema check.
+        return self._run(prompt, num_predict=120, json_format=True)
+
+    def _run(self, prompt: str, num_predict: int = 10, json_format: bool = False) -> str:
+        body = {
             "model": self._model,
             "prompt": prompt,
             "stream": False,
             "options": {
                 "temperature": 0.0,
-                "num_predict": 10,
+                "num_predict": num_predict,
             },
-        }).encode("utf-8")
+        }
+        if json_format:
+            body["format"] = "json"
+        payload = json.dumps(body).encode("utf-8")
 
         req = urllib.request.Request(
             f"{self._host}/api/generate",

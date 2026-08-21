@@ -39,6 +39,20 @@ if os.path.exists(_baseline_path):
     except Exception as e:
         logger.error(f"Failed to load Safe Baseline in InputFilter: {e}")
 
+if not _SAFE_BASELINE:
+    # Do not fail silently. The Safe Baseline is the control that stops
+    # everyday vocabulary from counting as an attack signal; without it,
+    # ordinary words become eligible and the false-positive rate rises.
+    # This previously degraded with no indication at all, which is how the
+    # data directory being untracked in git went unnoticed - a fresh clone
+    # simply produced a quietly weaker filter.
+    logger.warning(
+        "Safe Baseline is EMPTY (expected at %s). Single-word matching will "
+        "be more aggressive and the false-positive rate will be higher than "
+        "documented. Reinstall the package or restore sovereign_shield/data/.",
+        _baseline_path,
+    )
+
 # Security terms BASE — core terms not already in _DANGER_ACTIONS or _DANGER_TARGETS.
 # The full _SECURITY_TERMS is auto-computed below after _DANGER_ACTIONS/_DANGER_TARGETS.
 _SECURITY_TERMS_BASE = {
@@ -168,6 +182,65 @@ _DANGER_TARGETS = {
 # treated as "always-informative" by the Noun/Verb Proxy Heuristic.
 _SECURITY_TERMS = _SECURITY_TERMS_BASE | _DANGER_ACTIONS | _DANGER_TARGETS
 
+
+def is_informative(term, include_tech=True, security_overrides_baseline=True,
+                   security_terms=None, stopwords=None, baseline=None):
+    """
+    Noun/Verb Proxy Heuristic - does a single-word keyword match carry enough
+    signal to count as a hit?
+
+    This is the single control that keeps the false-positive rate at zero on
+    ordinary vocabulary, so it lives in one place instead of being restated at
+    every call site (it was previously copy-pasted six times across this module
+    and adaptive.py, and the copies had drifted apart).
+
+    A security term counts. Anything else counts only if it looks technical, is
+    long enough, or belongs to a non-Latin script AND is absent from both the
+    Safe Baseline and the stopword list.
+
+    Args:
+        term: the candidate keyword.
+        include_tech: whether hyphen/underscore/non-alphanumeric formatting
+            counts as evidence. Pass False for word-split matching, where such
+            characters have already been stripped.
+        security_overrides_baseline: if True (detection), a security term
+            counts even when it also appears in the Safe Baseline. If False
+            (keyword *learning*), a security term that is also an everyday word
+            is skipped, so common vocabulary like "show" is never learned as an
+            attack keyword. The two paths genuinely want different answers here;
+            the difference used to be an accident of operator precedence.
+        security_terms / stopwords / baseline: word sets to test against.
+            Default to this module's sets; adaptive.py passes its own
+            lower-cased equivalents.
+
+    Membership tests are case-insensitive because the three sets do not share a
+    casing convention (_SECURITY_TERMS and _STOPWORDS are upper-case here,
+    _SAFE_BASELINE is lower-case, and adaptive.py lower-cases all three).
+    """
+    security_terms = _SECURITY_TERMS if security_terms is None else security_terms
+    stopwords = _STOPWORDS if stopwords is None else stopwords
+    baseline = _SAFE_BASELINE if baseline is None else baseline
+
+    def _member(word, collection):
+        return (word in collection
+                or word.lower() in collection
+                or word.upper() in collection)
+
+    is_sec = _member(term, security_terms)
+    if is_sec and security_overrides_baseline:
+        return True
+
+    is_tech = include_tech and ('-' in term or '_' in term or not term.isalnum())
+    is_long = len(term) >= 7
+    # Special Script (Asian, Arabic, Hindi, Cyrillic) bypass: 2-3 chars in
+    # these scripts can be a whole word.
+    is_special = any(ord(c) > 0x024F for c in term)
+    if not (is_sec or is_tech or is_long or is_special):
+        return False
+
+    return not (_member(term, baseline) or _member(term, stopwords))
+
+
 # Default prompt injection keywords
 DEFAULT_BAD_SIGNALS = [
     "IGNORE PREVIOUS", "SYSTEM PROMPT", "DROP DATABASE",
@@ -229,6 +302,14 @@ DEFAULT_BAD_SIGNALS = [
     "NETCAT ", "NCAT ", "NC -E", "NC -L",
     "CURL HTTP", "CURL -O", "WGET HTTP", "WGET -O",
     "CURL ", "WGET ", "| BASH", "| SH", "|BASH", "|SH",
+    # Privilege escalation. "SUDO" carried no weight at all before this:
+    # it lived in _SECURITY_TERMS (which only decides whether a match is
+    # informative) but was never itself a signal, so "SUDO give me access"
+    # scored zero. The multi-word entries are phrases, so they count as a
+    # hit on their own; "SUDO" alone contributes one informative hit.
+    "SUDO", "PRIVILEGE ESCALATION", "ESCALATE PRIVILEGES",
+    "GIVE ME ROOT", "GRANT ME ROOT", "GIVE ME ADMIN", "GRANT ME ADMIN",
+    "ROOT ACCESS", "ADMIN ACCESS", "ADMINISTRATOR ACCESS",
     "FETCH(", "XMLHTTPREQUEST",
     # JavaScript / Node.js RCE
     "REQUIRE('CHILD_PROCESS')", "CHILD_PROCESS",
@@ -562,23 +643,14 @@ class InputFilter:
                     continue
                 
                 # Apply NOUN/VERB PROXY HEURISTIC to single-word signals
-                # Skip if in baseline OR if it's an uninformative generic word
-                is_sec = bad in _SECURITY_TERMS
-                is_tech = '-' in bad or '_' in bad or not bad.isalnum()
-                is_long = len(bad) >= 7
-                # Special Script (Asian, Arabic, Hindi, Cyrillic) Bypass:
-                # 2-3 chars in these scripts can be a full word. 
-                is_special = any(ord(c) > 0x024F for c in bad)
-                is_base = bad.lower() in _SAFE_BASELINE or bad in _STOPWORDS
-                
-                # Rule: Security terms ALWAYS count. Others only if not in baseline/stopwords.
-                if is_sec or ((is_tech or is_long or is_special) and not is_base):
+                if is_informative(bad):
                     hit_count += 1
 
         if hit_count >= 2:
             logger.warning(f"[InputFilter] Blocked prompt injection keyword: {text[:50]}...")
             return False, "Prompt injection detected.", 100
         elif hit_count == 1:
+            # Near-miss: one bad signal found but not enough to block
             suspicion += 12
 
         # --- Layer 6.5: Word-Level Co-occurrence ---
@@ -588,18 +660,15 @@ class InputFilter:
         # Strip punctuation from words for matching
         words_clean = {w.strip('.,;:!?\'"()[]{}') for w in words_in_text}
         # Filter action/target hits against the Safe Baseline + Informative Heuristic
-        action_hits = {
-            h for h in (words_clean & _DANGER_ACTIONS) 
-            if (h in _SECURITY_TERMS or ((len(h) >= 7 or any(ord(c) > 0x024F for c in h)) and h.lower() not in _SAFE_BASELINE and h not in _STOPWORDS))
-        }
-        target_hits = {
-            h for h in (words_clean & _DANGER_TARGETS) 
-            if (h in _SECURITY_TERMS or ((len(h) >= 7 or any(ord(c) > 0x024F for c in h)) and h.lower() not in _SAFE_BASELINE and h not in _STOPWORDS))
-        }
+        action_hits = {h for h in (words_clean & _DANGER_ACTIONS)
+                       if is_informative(h, include_tech=False)}
+        target_hits = {h for h in (words_clean & _DANGER_TARGETS)
+                       if is_informative(h, include_tech=False)}
         if action_hits and target_hits and (len(action_hits) + len(target_hits)) >= 3:
             logger.warning(f"[InputFilter] Blocked co-occurrence: actions={action_hits} targets={target_hits} in: {text[:50]}...")
             return False, "Prompt injection detected (action+target co-occurrence).", 100
         elif action_hits and target_hits:
+            # Near-miss: action+target pair found but below blocking threshold
             suspicion += 15
 
         # --- Layer 6.7: Multi-Decode Expansion ---
@@ -624,43 +693,35 @@ class InputFilter:
                         variant_hits += 1
                         continue
                     
-                    is_sec = bad in _SECURITY_TERMS
-                    is_tech = '-' in bad or '_' in bad or not bad.isalnum()
-                    is_long = len(bad) >= 7
-                    is_special = any(ord(c) > 0x024F for c in bad)
-                    is_base = bad.lower() in _SAFE_BASELINE or bad in _STOPWORDS
-                    
-                    if is_sec or ((is_tech or is_long or is_special) and not is_base):
+                    if is_informative(bad):
                         variant_hits += 1
 
             if variant_hits >= 2:
                 logger.warning(f"[InputFilter] Blocked encoded injection (multi-decode): {text[:50]}...")
                 return False, "Encoded prompt injection detected (multi-decode).", 100
             elif variant_hits == 1:
-                suspicion += 10
+                suspicion += 10  # Near-miss in decoded variant
             
             # Also check co-occurrence on decoded variants with Safe Baseline + Heuristic
             vwords = {w.strip('.,;:!?\'"()[]{}') for w in variant_upper.split()}
-            vactions = {
-                a for a in (vwords & _DANGER_ACTIONS) 
-                if (a in _SECURITY_TERMS or ((len(a) >= 7 or any(ord(c) > 0x024F for c in a)) and a.lower() not in _SAFE_BASELINE and a not in _STOPWORDS))
-            }
-            vtargets = {
-                t for t in (vwords & _DANGER_TARGETS) 
-                if (t in _SECURITY_TERMS or ((len(t) >= 7 or any(ord(c) > 0x024F for c in t)) and t.lower() not in _SAFE_BASELINE and t not in _STOPWORDS))
-            }
+            vactions = {a for a in (vwords & _DANGER_ACTIONS)
+                        if is_informative(a, include_tech=False)}
+            vtargets = {t for t in (vwords & _DANGER_TARGETS)
+                        if is_informative(t, include_tech=False)}
             if vactions and vtargets and (len(vactions) + len(vtargets)) >= 2:
                 logger.warning(f"[InputFilter] Blocked encoded co-occurrence (multi-decode): {text[:50]}...")
                 return False, "Encoded prompt injection detected (multi-decode co-occurrence).", 100
             elif vactions or vtargets:
-                suspicion += 8
+                suspicion += 8  # Near-miss co-occurrence in decoded variant
 
         # --- Layer 7: Safe Keyword Bypass ---
         # If the input contains a whitelisted keyword (e.g. internal tool name),
         # pass through immediately.
         if any(kw in text.lower() for kw in self.safe_keywords):
-            return True, text, 0
+            return True, text, 0  # Whitelisted -> zero suspicion
 
+        # --- Layer 8: Excessive Length Anomaly ---
+        # Unusually long inputs get a small suspicion bump
         if len(text) > 5000:
             suspicion += 8
 

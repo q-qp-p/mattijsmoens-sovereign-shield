@@ -16,7 +16,12 @@ import threading
 import logging
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from sovereign_shield.providers.base import LLMProvider
-from sovereign_shield.prompts import VERIFICATION_PROMPT
+from sovereign_shield.prompts import (
+    VERIFICATION_PROMPT,
+    STRUCTURED_VERIFICATION_PROMPT,
+    VERDICT_CATEGORIES,
+    VERDICT_SEVERITIES,
+)
 
 logger = logging.getLogger("sovereign_shield.gemini")
 
@@ -64,28 +69,40 @@ class GeminiProvider(LLMProvider):
                 time.sleep(wait)
             self._last_call = time.monotonic()
 
-    def _call_api(self, prompt: str) -> str:
+    def _call_api(self, prompt: str, max_output_tokens: int = 10) -> str:
         """Make the actual API call (runs in thread for timeout control)."""
         response = self._client.models.generate_content(
             model=self._model_name,
             contents=prompt,
             config={
                 "temperature": 0.0,
-                "max_output_tokens": 10,
+                "max_output_tokens": max_output_tokens,
             },
         )
         return response.text.strip()
 
     def verify(self, text: str) -> str:
-        prompt = VERIFICATION_PROMPT.format(text=text)
+        return self._run(VERIFICATION_PROMPT.format(text=text), max_output_tokens=10)
 
+    def verify_structured(self, text: str) -> str:
+        """Ask for a JSON verdict document for multi-model consensus."""
+        prompt = STRUCTURED_VERIFICATION_PROMPT.format(
+            text=text,
+            categories=list(VERDICT_CATEGORIES),
+            severities=list(VERDICT_SEVERITIES),
+        )
+        # A structured document needs far more room than a one-word verdict;
+        # truncation would make the JSON unparseable and fail closed.
+        return self._run(prompt, max_output_tokens=120)
+
+    def _run(self, prompt: str, max_output_tokens: int = 10) -> str:
         last_error = None
         for attempt in range(self._max_retries + 1):
             # Respect rate limit before each attempt
             self._wait_for_rate_limit()
 
             try:
-                future = _executor.submit(self._call_api, prompt)
+                future = _executor.submit(self._call_api, prompt, max_output_tokens)
                 return future.result(timeout=self._timeout)
 
             except FuturesTimeout:

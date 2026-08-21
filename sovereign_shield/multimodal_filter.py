@@ -44,6 +44,28 @@ _MAGIC_SIGNATURES = {
     b"\xcf\xfa\xed\xfe": "application/x-executable",  # Mach-O 64
 }
 
+# Executable markup that must never appear inside an image payload.
+# Matched against a lowercased copy of the data, since HTML tag names are
+# case-insensitive.
+#
+# Every marker must be at least 5 bytes. Image payloads are compressed binary,
+# so a SHORT marker is not evidence of anything: b"<%" is two bytes, which
+# appears with near-certainty somewhere in a multi-megabyte file by chance
+# alone, and flagged ordinary photographs. b"<svg" (4 bytes) is borderline for
+# the same reason and buys nothing here, since image/svg+xml is not a
+# recognised magic-byte type in the first place.
+_POLYGLOT_MARKERS = (
+    b"<script",
+    b"<?php",
+    b"<!doctype html",
+    b"<html",
+    b"<iframe",
+    b"javascript:",
+)
+assert all(len(m) >= 5 for m in _POLYGLOT_MARKERS), (
+    "polyglot markers must be long enough not to occur by chance in binary data"
+)
+
 # MIME types allowed by default
 _DEFAULT_ALLOWED_TYPES = {
     "image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp",
@@ -97,16 +119,21 @@ class MultiModalFilter:
         allowed_types=None,
         max_file_size_mb=25,
         max_filename_length=255,
+        detect_polyglots=True,
     ):
         """
         Args:
             allowed_types: Set of allowed MIME types. Uses defaults if None.
             max_file_size_mb: Maximum file size in megabytes.
             max_filename_length: Maximum filename length in characters.
+            detect_polyglots: Reject files that are a structurally valid image
+                by magic bytes but carry executable markup in their body (the
+                GIFAR/polyglot vector). Enabled by default.
         """
         self.allowed_types = allowed_types or _DEFAULT_ALLOWED_TYPES
         self.max_file_size_bytes = int(max_file_size_mb * 1024 * 1024)
         self.max_filename_length = max_filename_length
+        self.detect_polyglots = detect_polyglots
         self._input_filter = _InputFilter() if _HAS_INPUT_FILTER else None
 
     def _detect_type(self, data):
@@ -119,6 +146,20 @@ class MultiModalFilter:
                         continue
                 return mime_type
         return "application/octet-stream"
+
+    @staticmethod
+    def _find_polyglot_marker(data):
+        """Return the first executable-markup marker found, or None.
+
+        Only high-signal sequences are used. Image payloads are compressed
+        binary, so an exact match on any of these is vanishingly unlikely to
+        occur by chance even in a multi-megabyte file.
+        """
+        lowered = data.lower()
+        for marker in _POLYGLOT_MARKERS:
+            if marker in lowered:
+                return marker.decode("ascii", "replace")
+        return None
 
     def _check_exif(self, data):
         """Check if JPEG data contains EXIF metadata (APP1 marker)."""
@@ -217,7 +258,23 @@ class MultiModalFilter:
             )
             return result
 
-        # --- Check 8: EXIF metadata detection ---
+        # --- Check 8: Polyglot payload ---
+        # A file can be a structurally valid image by magic bytes and still
+        # carry executable markup in its body - the GIFAR/polyglot vector,
+        # e.g. b"GIF89a;<script>...</script>", which passes every check above.
+        # Compressed image data essentially never contains these byte
+        # sequences by chance, so a hit is strong evidence of a smuggled
+        # payload rather than a false positive.
+        if self.detect_polyglots and actual_type.startswith("image/"):
+            marker = self._find_polyglot_marker(data)
+            if marker:
+                result["reason"] = (
+                    f"Polyglot payload detected: valid {actual_type} carrying "
+                    f"embedded markup ({marker!r})."
+                )
+                return result
+
+        # --- Check 9: EXIF metadata detection ---
         if actual_type == "image/jpeg":
             has_exif = self._check_exif(data)
             result["stripped_metadata"] = has_exif

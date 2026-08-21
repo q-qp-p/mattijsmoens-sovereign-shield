@@ -8,6 +8,8 @@ The C extension is optional. If it cannot be compiled, the package
 falls back to the ctypes-based implementation automatically.
 """
 
+import os
+
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
 import sys
@@ -44,7 +46,19 @@ frozen_memory_ext = Extension(
 if sys.platform == "win32":
     frozen_memory_ext.libraries = ["kernel32"]
 
+# Building the extension makes the wheel platform-specific. Every previously
+# published wheel was cp312-win_amd64, so the wheel was uninstallable on Linux
+# and macOS and those users silently fell back to the sdist. The engine is pure
+# stdlib and hardware_protection falls back to ctypes, so the release build
+# sets SOVEREIGN_SHIELD_SKIP_EXT=1 to produce a portable py3-none-any wheel.
+# The .c source still ships, so anyone can compile it locally with
+# `python setup.py build_ext --inplace`.
+_ext_modules = (
+    [] if os.environ.get("SOVEREIGN_SHIELD_SKIP_EXT") == "1"
+    else [frozen_memory_ext]
+)
+
 setup(
-    ext_modules=[frozen_memory_ext],
+    ext_modules=_ext_modules,
     cmdclass={"build_ext": OptionalBuildExt},
 )

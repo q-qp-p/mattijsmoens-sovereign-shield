@@ -22,6 +22,7 @@ import json
 from typing import Optional, List, Set, Dict
 
 from .input_filter import InputFilter, DEFAULT_BAD_SIGNALS, _SECURITY_TERMS as _INPUT_SECURITY_TERMS
+from .input_filter import is_informative
 
 logger = logging.getLogger("adaptive_shield")
 
@@ -153,13 +154,46 @@ class AdaptiveShield:
         retention_days: int = 30,
         auto_deploy: bool = True,
         allow_pruning: bool = True,
+        min_baseline_samples: int = 100,
+        baseline_corpus_path: Optional[str] = None,
     ):
+        """
+        Args:
+            min_baseline_samples: Distinct benign samples required before a
+                learned keyword may be auto-deployed. Guards against deploying
+                rules validated against an empty or near-empty history. Set to
+                0 to restore the previous behaviour.
+            baseline_corpus_path: Optional newline-delimited file of known-benign
+                inputs. The scan log is writable by anyone who can call scan(),
+                so it can be poisoned; a curated corpus cannot. When supplied it
+                is authoritative and a keyword must clear both baselines.
+        """
         self._db_path = db_path
         self._fp_threshold = fp_threshold
         self._retention_days = retention_days
         self._auto_deploy = auto_deploy
         self._allow_pruning = allow_pruning
+        self._min_baseline_samples = min_baseline_samples
         self._lock = threading.Lock()
+
+        # Curated benign corpus (optional, trusted)
+        self._baseline_corpus: List[str] = []
+        if baseline_corpus_path:
+            try:
+                with open(baseline_corpus_path, "r", encoding="utf-8") as f:
+                    self._baseline_corpus = [
+                        line.strip().lower() for line in f if line.strip()
+                    ]
+                logger.info(
+                    f"Loaded curated benign baseline: "
+                    f"{len(self._baseline_corpus)} samples from {baseline_corpus_path}"
+                )
+            except Exception as e:
+                # Fail closed: a corpus that was requested but could not be read
+                # must not silently downgrade to the poisonable scan log.
+                raise RuntimeError(
+                    f"baseline_corpus_path was supplied but could not be read: {e}"
+                ) from e
 
         # Built-in filter
         signals = list(DEFAULT_BAD_SIGNALS)
@@ -203,7 +237,6 @@ class AdaptiveShield:
         conn = self._get_conn()
         conn.executescript(_SCHEMA)
         conn.commit()
-        pass  # conn.close() removed for connection pooling
 
 
 
@@ -249,7 +282,6 @@ class AdaptiveShield:
             )
 
         conn.commit()
-        pass  # conn.close() removed for connection pooling
         logger.info(f"Imported {len(rule_rows)} rules and {len(kw_rows)} keywords from {path}")
 
     def _load_approved_rules(self):
@@ -258,7 +290,6 @@ class AdaptiveShield:
         cur.execute("SELECT pattern FROM rules WHERE status = 'approved'")
         for row in cur.fetchall():
             self._custom_rules.add(row["pattern"].lower())
-        pass  # conn.close() removed for connection pooling
         if self._custom_rules:
             logger.info(f"Loaded {len(self._custom_rules)} custom rules from database.")
 
@@ -276,7 +307,6 @@ class AdaptiveShield:
                 self._category_keywords[cat].add(kw)
         except sqlite3.OperationalError:
             pass  # Table may not exist yet on first run
-        pass  # conn.close() removed for connection pooling
         total = sum(len(v) for v in self._category_keywords.values())
         if total:
             logger.info(f"Loaded {total} category keywords across {len(self._category_keywords)} categories.")
@@ -286,7 +316,6 @@ class AdaptiveShield:
         conn = self._get_conn()
         conn.execute("DELETE FROM scan_log WHERE timestamp < ?", (cutoff,))
         conn.commit()
-        pass  # conn.close() removed for connection pooling
 
     # ------------------------------------------------------------------
     # SCAN
@@ -321,13 +350,13 @@ class AdaptiveShield:
                     if ' ' in rule:
                         matched_rules.append(rule)
                         continue
-                    # Heuristic for single-word custom rules
-                    is_sec = rule in _SECURITY_TERMS
-                    is_long = len(rule) >= 7
-                    is_special = any(ord(c) > 0x024F for c in rule)
-                    is_base = rule.lower() in _SAFE_BASELINE
-                    
-                    if is_sec or ((is_long or is_special) and not is_base):
+                    # Heuristic for single-word custom rules. Unlike the other
+                    # call sites this one has never consulted _STOPWORDS, so an
+                    # empty stopword set preserves that behaviour.
+                    if is_informative(rule, include_tech=False,
+                                      security_terms=_SECURITY_TERMS,
+                                      stopwords=frozenset(),
+                                      baseline=_SAFE_BASELINE):
                         matched_rules.append(rule)
 
             if len(matched_rules) >= 2:
@@ -355,14 +384,9 @@ class AdaptiveShield:
                             continue
                         
                         # Apply Informative Heuristic to single-word signals
-                        # Skip if in baseline OR if it's an uninformative generic word
-                        is_sec = kw in _SECURITY_TERMS
-                        is_tech = '-' in kw or '_' in kw or not kw.isalnum()
-                        is_long = len(kw) >= 7
-                        is_special = any(ord(c) > 0x024F for c in kw)
-                        is_base = kw.lower() in _SAFE_BASELINE or kw.lower() in _STOPWORDS
-                        
-                        if is_sec or ((is_tech or is_long or is_special) and not is_base):
+                        if is_informative(kw, security_terms=_SECURITY_TERMS,
+                                          stopwords=_STOPWORDS,
+                                          baseline=_SAFE_BASELINE):
                             matched.append(kw)
 
                 if len(matched) >= 3:  # Require 3+ keyword matches to reduce FP
@@ -384,7 +408,6 @@ class AdaptiveShield:
                 (scan_id, text, int(is_safe), stage, reason, time.time()),
             )
             conn.commit()
-            pass  # conn.close() removed for connection pooling
 
         return {
             "scan_id": scan_id,
@@ -423,7 +446,6 @@ class AdaptiveShield:
             (scan_id,),
         )
         row = cur.fetchone()
-        pass  # conn.close() removed for connection pooling
 
         if not row:
             return {"report_id": None, "status": "error", "rule_created": False,
@@ -448,7 +470,6 @@ class AdaptiveShield:
                 (report_id, scan_id, input_text, reason, time.time(), "pending"),
             )
             conn.commit()
-            pass  # conn.close() removed for connection pooling
 
         # --- V2: Keyword extraction + category classification ---
         keywords = self._extract_keywords(input_text)
@@ -489,7 +510,6 @@ class AdaptiveShield:
                         except sqlite3.IntegrityError:
                             pass
                     conn.commit()
-                    pass  # conn.close() removed for connection pooling
 
                 # Update in-memory category keywords
                 if category not in self._category_keywords:
@@ -502,7 +522,14 @@ class AdaptiveShield:
         sandbox = self._replay(pattern, exclude_scan_id=scan_id)
 
         rule_id = uuid.uuid4().hex[:12]
-        passes_threshold = sandbox["false_positive_rate"] <= self._fp_threshold
+        # A low FP rate measured against too few samples is not evidence.
+        # Without this gate the first reports on a fresh install deployed
+        # rules validated against an empty history.
+        enough_baseline = sandbox["total_tested"] >= self._min_baseline_samples
+        passes_threshold = (
+            sandbox["false_positive_rate"] <= self._fp_threshold
+            and enough_baseline
+        )
 
         cat_info = (f" Category: '{category}', "
                     f"{len(new_keywords)} new keywords added.") if category else ""
@@ -594,7 +621,6 @@ class AdaptiveShield:
                      time.time(), "pending_prune"),
                 )
                 conn.commit()
-                pass  # conn.close() removed for connection pooling
             return {
                 "status": "pending_review",
                 "pruned_keywords": [],
@@ -610,7 +636,6 @@ class AdaptiveShield:
             (scan_id,),
         )
         row = cur.fetchone()
-        pass  # conn.close() removed for connection pooling
 
         if not row:
             return {"status": "error", "pruned_keywords": [],
@@ -667,7 +692,6 @@ class AdaptiveShield:
                             learned_kws.discard(kw)
                             pruned.append(kw)
                         conn.commit()
-                        pass  # conn.close() removed for connection pooling
 
                     # Clean up empty categories
                     if not learned_kws:
@@ -689,7 +713,6 @@ class AdaptiveShield:
                  time.time(), "false_positive"),
             )
             conn.commit()
-            pass  # conn.close() removed for connection pooling
 
         if pruned:
             return {
@@ -716,12 +739,13 @@ class AdaptiveShield:
         """Test a pattern against all historical allowed scans."""
         conn = self._get_conn()
         cur = conn.cursor()
+        # DISTINCT so repeated identical inputs cannot skew the ratio.
         cur.execute(
-            "SELECT input_text FROM scan_log WHERE allowed = 1 AND input_text != '' AND scan_id != ?",
+            "SELECT DISTINCT input_text FROM scan_log WHERE allowed = 1 "
+            "AND input_text != '' AND scan_id != ?",
             (exclude_scan_id,)
         )
         rows = cur.fetchall()
-        pass  # conn.close() removed for connection pooling
 
         total = len(rows)
         if total == 0:
@@ -748,29 +772,62 @@ class AdaptiveShield:
         Returns:
             {"safe": bool, "total_tested": int, "would_block": int, "fp_rate": float}
         """
+        kw_lower = keyword.lower()
+
+        # --- Curated baseline (trusted, if configured) ---
+        # The scan log is written to by anyone who can call scan(), which makes
+        # it attacker-influenceable: flooding benign-looking traffic containing
+        # a term drives its apparent FP rate up and permanently immunizes that
+        # term from ever being learned. A curated corpus is not writable by
+        # callers, so when one is supplied it is authoritative and the keyword
+        # must clear BOTH baselines.
+        if self._baseline_corpus:
+            curated_total = len(self._baseline_corpus)
+            curated_hits = sum(1 for line in self._baseline_corpus if kw_lower in line)
+            curated_rate = curated_hits / curated_total
+            if curated_rate > self._fp_threshold:
+                return {
+                    "safe": False,
+                    "total_tested": curated_total,
+                    "would_block": curated_hits,
+                    "fp_rate": round(curated_rate, 4),
+                    "baseline": "curated",
+                }
+
         conn = self._get_conn()
         cur = conn.cursor()
+        # DISTINCT so that flooding the same benign string many times cannot
+        # move the ratio on its own.
         cur.execute(
-            "SELECT input_text FROM scan_log WHERE allowed = 1 "
+            "SELECT DISTINCT input_text FROM scan_log WHERE allowed = 1 "
             "AND input_text != '' AND scan_id != ?",
             (exclude_scan_id,),
         )
         rows = cur.fetchall()
-        pass  # conn.close() removed for connection pooling
 
         total = len(rows)
-        if total == 0:
-            # No history yet — allow keyword but with lower confidence
-            return {"safe": True, "total_tested": 0, "would_block": 0, "fp_rate": 0.0}
+        if total < self._min_baseline_samples:
+            # Too little evidence to conclude anything. Previously this
+            # returned safe=True, so the very first reports deployed keywords
+            # that had been validated against nothing at all. Fail closed:
+            # the rule is still recorded, it just is not auto-deployed.
+            return {
+                "safe": False,
+                "total_tested": total,
+                "would_block": 0,
+                "fp_rate": 0.0,
+                "baseline": "insufficient",
+                "reason": (
+                    f"Only {total} distinct benign samples available; "
+                    f"{self._min_baseline_samples} required before a keyword "
+                    f"can be auto-deployed."
+                ),
+            }
 
-        # Count how many allowed inputs contain this keyword
-        kw_lower = keyword.lower()
         would_block = sum(
             1 for r in rows if kw_lower in r["input_text"].lower()
         )
         fp_rate = would_block / total
-
-        # Reject if >5% of benign traffic contains this keyword
         safe = fp_rate <= self._fp_threshold
 
         return {
@@ -778,6 +835,7 @@ class AdaptiveShield:
             "total_tested": total,
             "would_block": would_block,
             "fp_rate": round(fp_rate, 4),
+            "baseline": "scan_log",
         }
 
     def _save_rule(self, rule_id, pattern, report_id, sandbox, status):
@@ -791,7 +849,6 @@ class AdaptiveShield:
                  sandbox["total_tested"], status, time.time()),
             )
             conn.commit()
-            pass  # conn.close() removed for connection pooling
 
     # ------------------------------------------------------------------
     # KEYWORD EXTRACTION + CLASSIFICATION
@@ -811,14 +868,15 @@ class AdaptiveShield:
             # Clean punctuation (excluding dashes/underscores for tech terms)
             clean = word.strip('.,!?;:\'"()[]{}/')
             
-            # Apply Informative Heuristic (using module-level _SECURITY_TERMS and _SAFE_BASELINE)
-            is_sec = clean in _SECURITY_TERMS
-            is_tech = '-' in clean or '_' in clean or not clean.isalnum()
-            is_long = len(clean) >= 7
-            is_special = any(ord(c) > 0x024F for c in clean)
-            is_safe = clean in _STOPWORDS or clean in _SAFE_BASELINE or clean in seen
-            
-            if (is_sec or is_tech or is_long or is_special) and not is_safe:
+            # Apply Informative Heuristic. This is the *learning* path, so a
+            # security term that is also an everyday word (e.g. "show") is NOT
+            # promoted -- we do not want common vocabulary becoming an attack
+            # keyword. Hence security_overrides_baseline=False, which is the
+            # one deliberate difference from the detection call sites.
+            if clean not in seen and is_informative(
+                    clean, security_overrides_baseline=False,
+                    security_terms=_SECURITY_TERMS, stopwords=_STOPWORDS,
+                    baseline=_SAFE_BASELINE):
                 candidates.append(clean)
                 seen.add(clean)
         
@@ -878,7 +936,6 @@ class AdaptiveShield:
         else:
             cur.execute("SELECT * FROM rules")
         rows = [dict(r) for r in cur.fetchall()]
-        pass  # conn.close() removed for connection pooling
         return rows
 
     def approve_rule(self, rule_id: str) -> bool:
@@ -888,12 +945,10 @@ class AdaptiveShield:
         cur.execute("SELECT pattern FROM rules WHERE rule_id = ?", (rule_id,))
         row = cur.fetchone()
         if not row:
-            pass  # conn.close() removed for connection pooling
             return False
         pattern = row["pattern"].lower()
         conn.execute("UPDATE rules SET status = 'approved' WHERE rule_id = ?", (rule_id,))
         conn.commit()
-        pass  # conn.close() removed for connection pooling
         self._custom_rules.add(pattern)
         return True
 
@@ -902,7 +957,6 @@ class AdaptiveShield:
         conn = self._get_conn()
         conn.execute("UPDATE rules SET status = 'rejected' WHERE rule_id = ?", (rule_id,))
         conn.commit()
-        pass  # conn.close() removed for connection pooling
         return True
 
     def approve_all_pending(self) -> int:
@@ -920,7 +974,6 @@ class AdaptiveShield:
             self._custom_rules.add(row["pattern"].lower())
             count += 1
         conn.commit()
-        pass  # conn.close() removed for connection pooling
         return count
 
     def get_reports(self) -> List[dict]:
@@ -929,7 +982,6 @@ class AdaptiveShield:
         cur = conn.cursor()
         cur.execute("SELECT * FROM reports ORDER BY timestamp DESC")
         rows = [dict(r) for r in cur.fetchall()]
-        pass  # conn.close() removed for connection pooling
         return rows
 
     @property
@@ -955,7 +1007,6 @@ class AdaptiveShield:
         approved = cur.fetchone()["c"]
         cur.execute("SELECT COUNT(*) as c FROM rules WHERE status = 'pending'")
         pending = cur.fetchone()["c"]
-        pass  # conn.close() removed for connection pooling
         return {
             "total_scans": total_scans,
             "total_reports": total_reports,

@@ -247,6 +247,44 @@ class FrozenNamespace(type):
         raise TypeError(f"IMMUTABILITY VIOLATION: Cannot delete protected attribute '{key}'")
 
 
+#: Payloads that are dangerous whatever the action is labelled. Checked for
+#: every action type. Before 3.4.4 these lived in a list gated on speech-like
+#: actions, so a shell payload under SHELL_EXEC, MCP_TOOL_CALL or any
+#: unrecognised action type was never inspected at all.
+_ALWAYS_MALICIOUS = (
+    "rm -rf", ":(){ :|:& };:", "nc -e /bin/sh", "reverse shell",
+    "iex(new-object", "iex (new-object", "powershell -nop",
+    "os.dup2", "pty.spawn", "socket.socket(socket.af_inet",
+    "import socket,subprocess,os", "keylogger", "ddos script",
+)
+
+#: Ordinary inside code, SQL or markup. Kept scoped to actions where the model
+#: is asserting something rather than doing it - blanket-applying these to tool
+#: arguments would refuse legitimate calls against code and database tools.
+_CONTEXTUAL_MALICIOUS = (
+    "<script>", "</script>", "document.cookie",
+    "drop table", "union select", "1=1--",
+    "os.system", "subprocess.call", "subprocess.popen", "subprocess.run",
+    "eval(", "__import__(",
+)
+
+#: Pipe-to-shell, the most common remote-code-execution shape
+#: (`curl ... | bash`, `wget ... | sh`). a trailing word boundary keeps it from matching "shell",
+#: "show" or "sha256sum", so ordinary prose containing a pipe is unaffected.
+_PIPE_TO_SHELL = re.compile(r"\|\s*(?:ba|z|k|da|a)?sh\b")
+
+#: Credentials embedded in a URL. Check 6 catches these but only for BROWSE,
+#: so a tool call carrying one was never inspected.
+_CREDENTIAL_URL = re.compile(r"https?://[^/\s:@]+:[^/\s@]+@")
+
+#: Action types audit_action has a branch for. Anything else is honoured but
+#: logged, because an unrecognised type silently skipped every gated check.
+_KNOWN_ACTION_TYPES = frozenset({
+    "THINK", "SHELL_EXEC", "DELETE_FILE", "BROWSE", "WRITE_FILE",
+    "READ_FILE", "CAT", "TYPE", "GET_CONTENT",
+    "ANSWER", "REPLY", "SAY",
+})
+
 class CoreSafety(metaclass=FrozenNamespace):
     """
     Immutable security constitution for AI and autonomous systems.
@@ -597,6 +635,30 @@ class CoreSafety(metaclass=FrozenNamespace):
                     return False, "Protected information detected in output. Blocked."
 
         # --- Check 10: Malware Syntax Detection ---
+        # Split by whether a match is dangerous regardless of context. The
+        # always-malicious set runs for every action type, including ones this
+        # method has no branch for; without it, an unrecognised action_type
+        # skipped this check entirely.
+        payload_lower_c10 = str(payload).lower()
+        if action_type not in exempt_actions:
+            for syntax in _ALWAYS_MALICIOUS:
+                if syntax in payload_lower_c10:
+                    logger.critical(f"BLOCKED: Malicious syntax detected: '{syntax}'")
+                    return False, "Malicious payload syntax detected and blocked."
+            if _PIPE_TO_SHELL.search(payload_lower_c10):
+                logger.critical("BLOCKED: Pipe-to-shell detected.")
+                return False, "Piping downloaded content into a shell is blocked."
+            if _CREDENTIAL_URL.search(payload_lower_c10):
+                logger.critical("BLOCKED: Credentials embedded in a URL.")
+                return False, "URL contains embedded credentials."
+
+        if action_type not in _KNOWN_ACTION_TYPES:
+            logger.warning(
+                "audit_action received an unrecognised action_type %r. The "
+                "checks gated on action type did not run; only the "
+                "always-malicious payload scan applied. Use one of: %s",
+                action_type, ", ".join(sorted(_KNOWN_ACTION_TYPES)))
+
         if action_type in ["ANSWER", "REPLY", "SAY", "THINK", "WRITE_FILE"]:
             payload_lower = str(payload).lower()
             malicious_syntax = [

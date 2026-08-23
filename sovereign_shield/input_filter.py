@@ -333,7 +333,7 @@ DEFAULT_BAD_SIGNALS = [
     "GET_ADMIN_PASSWORD", "REVERSE SHELL",
 ]
 
-# Multilingual prompt injection keywords — top 15 languages by internet usage
+# Multilingual prompt injection keywords — 21 languages by internet usage
 MULTILINGUAL_BAD_SIGNALS = [
     # Spanish — inflected forms + natural phrasing + show system prompt
     "IGNORAR INSTRUCCIONES", "IGNORAR ANTERIORES", "MODO ADMINISTRADOR",
